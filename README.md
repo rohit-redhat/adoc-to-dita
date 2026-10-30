@@ -4,11 +4,11 @@ A local tool for three jobs:
 
 1. Paste or upload AsciiDoc and copy/download validated DITA XML.
 2. Compare two Git branches, tags, or commits and download the affected topics, before/after XML, and readable diffs.
-3. Paste a public GitHub pull request URL and download DITA XML for every changed or dependency-affected topic.
+3. Paste a public GitHub pull request or GitLab merge request URL and download DITA XML for every changed or dependency-affected topic.
 
 See [TESTING.md](TESTING.md) for automated coverage and pinned live results against `openshift/openshift-docs`.
 
-Supports **concept**, **task (procedure)**, and **reference** topics. No Vale, AI service, AEM connection, account, or database is required. The browser interface runs on your computer; GitHub access is only used when you choose a remote repository.
+Supports **concept**, **task (procedure)**, and **reference** topics. No Vale, AI service, AEM connection, account, or database is required. The browser interface runs on your computer; GitHub or GitLab access is only used when you choose a remote repository.
 
 ## Start
 
@@ -25,7 +25,7 @@ Open **http://127.0.0.1:8765**. Setup downloads pinned dependencies. Subsequent 
 
 ### Hosted deployment
 
-The same conversion and comparison features run in a container or OpenShift deployment. Set `ADOC_DITA_BIND_HOST=0.0.0.0` and list the public route host in `ADOC_DITA_ALLOWED_HOSTS`. A hosted browser cannot read paths on a visitor's computer, so users upload local source and attributes files through the form. Network-bound API requests reject server filesystem paths. Release comparison and pull request conversion accept public GitHub URLs and need outbound DNS and HTTPS access to GitHub.
+The same conversion and comparison features run in a container or OpenShift deployment. Set `ADOC_DITA_BIND_HOST=0.0.0.0` and list the public route host in `ADOC_DITA_ALLOWED_HOSTS`. A hosted browser cannot read paths on a visitor's computer, so users upload local source and attributes files through the form. Network-bound API requests reject server filesystem paths. Release comparison and pull request conversion accept public GitHub and GitLab URLs and need outbound DNS and HTTPS access to those hosts.
 
 Comparison jobs are held in process memory. Run one replica unless job state is moved to shared storage; restarting the pod ends active jobs. The application has no built-in login, so put authentication and access controls in front of it when the route is not intended to be public.
 
@@ -63,7 +63,7 @@ The CLI retains an advanced `--repository --guide` mode for builds that explicit
 
 ### Compare releases
 
-Enter a public GitHub repository URL or a local Git repository path, then select two branch names, tags, or commit IDs. **Load releases** populates suggestions. Local repositories may use `origin/release-1.9` when that branch has not been checked out locally. Local repositories are not fetched automatically; run `git fetch` yourself when needed.
+Enter a public GitHub or GitLab repository URL or a local Git repository path, then select two branch names, tags, or commit IDs. **Load releases** populates suggestions. GitLab nested groups are supported (`https://gitlab.com/group/sub/project`). Default GitLab hosts are `gitlab.com` and `gitlab.cee.redhat.com`; add more with `ADOC_DITA_GITLAB_HOSTS=host1,host2`. Local repositories may use `origin/release-1.9` when that branch has not been checked out locally. Local repositories are not fetched automatically; run `git fetch` yourself when needed.
 
 Topic paths are optional. Leave the field blank to inspect all `.adoc` topics in both snapshots, map direct Git changes and dependency effects, and include only topics whose source or generated XML changed. To narrow the run, patterns use Python `fnmatch`: `*` also matches subdirectories, and the field accepts several comma-separated patterns. The scope is individual typed modules, not DITA map or book generation.
 
@@ -96,11 +96,13 @@ Additions, deletions, and Git-detected renames are reported. A successfully conv
 
 ### Convert a pull request
 
-Open **03 Convert pull request** and paste a public URL such as `https://github.com/owner/repository/pull/123`. The tool resolves the PR through GitHub, pins the exact base and head commits, discovers directly changed and dependency-affected `.adoc` topics, and runs the same conversion and validation pipeline used by the other workflows. It does not execute code from the repository.
+Open **03 Convert pull request** and paste a public GitHub URL such as `https://github.com/owner/repository/pull/123`, or a GitLab merge request URL such as `https://gitlab.com/group/project/-/merge_requests/123`. The tool resolves the change request through the host API, pins the exact base and head commits, discovers directly changed and dependency-affected `.adoc` topics, and runs the same conversion and validation pipeline used by the other workflows. It does not execute code from the repository.
 
-Leave **Topic paths** blank to process the complete PR. The attributes controls behave like release comparison: use a repository-relative path to read the file independently at the base and PR commits, upload one `.adoc` file to apply it to both, or rely on automatic `artifacts/attributes.adoc` detection. Each successful topic exposes its complete target XML in the page. The ZIP contains target XML under `after/`, base XML when available, source and XML diffs, `report.html`, and `report.json`.
+Leave **Topic paths** blank to process the complete PR/MR. The attributes controls behave like release comparison: use a repository-relative path to read the file independently at the base and PR commits, upload one `.adoc` file to apply it to both, or rely on automatic `artifacts/attributes.adoc` detection. Each successful topic exposes its complete target XML in the page. The ZIP contains target XML under `after/`, base XML when available, source and XML diffs, `report.html`, and `report.json`.
 
-The report records the PR number, title, URL, exact merge-base/head commit IDs, the current base tip, and conversion settings. Using the merge base makes the result match the changes introduced by the PR even when its base branch advances. If the PR head changes while a job is starting, the run stops instead of mixing snapshots. A hosted deployment requires outbound HTTPS access to `api.github.com` and `github.com`. Set an optional `GITHUB_TOKEN` environment variable on busy shared deployments to use GitHub's authenticated API rate limit; the token is never included in reports.
+The report records the PR/MR number, title, URL, exact merge-base/head commit IDs, the current base tip, and conversion settings. Using the merge base makes the result match the changes introduced by the request even when its base branch advances. If the head changes while a job is starting, the run stops instead of mixing snapshots. A hosted deployment requires outbound HTTPS access to GitHub (`api.github.com`, `github.com`) and/or your GitLab host. Set optional `GITHUB_TOKEN` or `GITLAB_TOKEN` environment variables for private repositories and higher API rate limits; tokens are never included in reports.
+
+Self-hosted GitLab (for example `gitlab.cee.redhat.com`) often uses a private CA. The tool relaxes TLS verification for those hosts unless you set `ADOC_DITA_CA_BUNDLE` / `SSL_CERT_FILE` to your corporate CA bundle, or force verification with `ADOC_DITA_SSL_VERIFY=1`. Public `github.com` and `gitlab.com` keep certificate verification enabled.
 
 ## CLI
 

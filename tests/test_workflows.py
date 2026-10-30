@@ -446,6 +446,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(metadata['repository'], 'https://github.com/example/docs')
         self.assertEqual(metadata['base']['commit'], 'c' * 40)
         self.assertEqual(metadata['base']['tip'], 'a' * 40)
+        self.assertEqual(metadata['provider'], 'github')
 
         converted = {'base': {'ref': 'main', 'commit': 'c' * 40},
                      'target': {'ref': 'refs/pull/42/head', 'commit': 'b' * 40},
@@ -457,9 +458,90 @@ class ComparisonTests(unittest.TestCase):
             report = compare_pull_request(metadata['url'], patterns=['modules/*.adoc'])
         routed.assert_called_once()
         self.assertEqual(routed.call_args.args[:3],
-                         (metadata['repository'], 'c' * 40, 'refs/pull/42/head'))
+                         (metadata['repository'], 'c' * 40, 'b' * 40))
         self.assertEqual(report['target']['ref'], 'PR #42')
         self.assertEqual(report['settings']['workflow'], 'pull_request')
+
+    def test_gitlab_merge_request_url_metadata_and_exact_snapshot_routing(self):
+        location = pull_request_location(
+            'https://gitlab.com/docs/guides/platform/-/merge_requests/7/diffs')
+        self.assertEqual(location['provider'], 'gitlab')
+        self.assertEqual(location['project_path'], 'docs/guides/platform')
+        self.assertEqual(location['number'], 7)
+        self.assertEqual(location['head_ref'], 'refs/merge-requests/7/head')
+        self.assertEqual(
+            pull_request_location('https://gitlab.cee.redhat.com/group/project/-/merge_requests/3')['host'],
+            'gitlab.cee.redhat.com')
+        for invalid in ['http://gitlab.com/group/project/-/merge_requests/7',
+                        'https://gitlab.com/group/project/merge_requests/7',
+                        'https://gitlab.com/group/project/-/merge_requests/0',
+                        'https://gitlab.com/group/project/-/issues/7']:
+            with self.assertRaises(ValueError):
+                pull_request_location(invalid)
+
+        payload = {
+            'title': 'Update GitLab docs',
+            'state': 'opened',
+            'target_branch': 'main',
+            'source_branch': 'writer/update',
+            'sha': 'b' * 40,
+            'web_url': 'https://gitlab.com/docs/guides/platform/-/merge_requests/7',
+            'references': {'full': 'docs/guides/platform!7'},
+            'diff_refs': {'base_sha': 'c' * 40, 'head_sha': 'b' * 40, 'start_sha': 'a' * 40},
+        }
+        branch = {'commit': {'id': 'd' * 40}}
+
+        class Response:
+            def __init__(self, value):
+                self.value = value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps(self.value).encode()
+
+        with patch('adoc_dita.repository.urlopen', side_effect=[Response(payload), Response(branch)]):
+            metadata = pull_request_metadata(
+                'https://gitlab.com/docs/guides/platform/-/merge_requests/7')
+        self.assertEqual(metadata['provider'], 'gitlab')
+        self.assertEqual(metadata['target']['ref'], 'refs/merge-requests/7/head')
+        self.assertEqual(metadata['repository'], 'https://gitlab.com/docs/guides/platform')
+        self.assertEqual(metadata['base']['commit'], 'c' * 40)
+        self.assertEqual(metadata['base']['tip'], 'd' * 40)
+        self.assertEqual(metadata['base']['ref'], 'main')
+
+        converted = {'base': {'ref': 'main', 'commit': 'c' * 40},
+                     'target': {'ref': 'refs/merge-requests/7/head', 'commit': 'b' * 40},
+                     'settings': {}, 'summary': {'files': 1, 'errors': 0,
+                                                'review': 0, 'xml_changed': 1},
+                     'files': [], 'changes': []}
+        with patch('adoc_dita.repository.pull_request_metadata', return_value=metadata), \
+                patch('adoc_dita.repository.compare', return_value=converted) as routed:
+            report = compare_pull_request(metadata['url'], patterns=['modules/*.adoc'])
+        routed.assert_called_once()
+        self.assertEqual(routed.call_args.args[:3],
+                         (metadata['repository'], 'c' * 40, 'b' * 40))
+        self.assertEqual(report['target']['ref'], 'PR #7')
+        self.assertEqual(report['settings']['workflow'], 'pull_request')
+
+    def test_remote_url_accepts_github_and_gitlab(self):
+        from adoc_dita.repository import remote_url
+        self.assertEqual(remote_url('https://github.com/owner/docs'),
+                         'https://github.com/owner/docs.git')
+        self.assertEqual(remote_url('https://gitlab.com/group/sub/project.git'),
+                         'https://gitlab.com/group/sub/project.git')
+        self.assertEqual(remote_url('https://gitlab.cee.redhat.com/ccs/docs'),
+                         'https://gitlab.cee.redhat.com/ccs/docs.git')
+        with self.assertRaises(ValueError):
+            remote_url('https://github.com/owner/group/docs')
+        with self.assertRaises(ValueError):
+            remote_url('https://gitlab.com/group/project/-/tree/main')
+        with self.assertRaises(ValueError):
+            remote_url('https://bitbucket.org/owner/docs')
 
     def test_automatic_scope_lists_but_does_not_convert_assemblies(self):
         report = compare(self.repo, 'v1', 'v2')

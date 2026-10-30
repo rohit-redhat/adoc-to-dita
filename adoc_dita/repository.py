@@ -9,10 +9,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import ssl
 import subprocess
 import tarfile
 import tempfile
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -22,75 +23,254 @@ from .report import file_diff
 
 INCLUDE_DIRECTIVE = re.compile(r"^\s*include::([^\[]+)\[", re.M)
 ATTRIBUTE_DEFINITION = re.compile(r"^:([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\s*$", re.M)
+PATH_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
+DEFAULT_GITLAB_HOSTS = frozenset({"gitlab.com", "gitlab.cee.redhat.com"})
+PUBLIC_TLS_HOSTS = frozenset({"github.com", "api.github.com", "gitlab.com"})
 
 
-def git(repo, *args, timeout=180):
+def gitlab_hosts():
+    hosts = set(DEFAULT_GITLAB_HOSTS)
+    for host in os.environ.get("ADOC_DITA_GITLAB_HOSTS", "").split(","):
+        host = host.strip().casefold()
+        if host:
+            hosts.add(host)
+    return hosts
+
+
+def remote_provider(hostname):
+    if not hostname:
+        return None
+    host = hostname.casefold()
+    if host == "github.com":
+        return "github"
+    if host in gitlab_hosts():
+        return "gitlab"
+    return None
+
+
+def is_supported_remote_repository(value):
+    try:
+        remote_url(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def ssl_ca_bundle():
+    for name in ("ADOC_DITA_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        path = os.environ.get(name, "").strip()
+        if path and Path(path).expanduser().is_file():
+            return str(Path(path).expanduser())
+    return None
+
+
+def ssl_verify_enabled(hostname=None):
+    """Return whether TLS certificates should be verified for this host.
+
+    Public GitHub/GitLab SaaS keeps verification on. Self-hosted GitLab often
+    presents a private CA that stock CPython does not trust; unless a CA bundle
+    is configured, verification is relaxed for those hosts. Override with
+    ADOC_DITA_SSL_VERIFY=1/0 or GIT_SSL_NO_VERIFY=1.
+    """
+    explicit = os.environ.get("ADOC_DITA_SSL_VERIFY", "").strip().lower()
+    if explicit in {"0", "false", "no", "off"}:
+        return False
+    if explicit in {"1", "true", "yes", "on"}:
+        return True
+    if os.environ.get("GIT_SSL_NO_VERIFY", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    host = (hostname or "").casefold()
+    if host in PUBLIC_TLS_HOSTS:
+        return True
+    if host and remote_provider(host) == "gitlab":
+        return bool(ssl_ca_bundle())
+    return True
+
+
+def ssl_context(hostname=None):
+    if not ssl_verify_enabled(hostname):
+        return ssl._create_unverified_context()
+    ca = ssl_ca_bundle()
+    if ca:
+        return ssl.create_default_context(cafile=ca)
+    return ssl.create_default_context()
+
+
+def git(repo, *args, timeout=180, hostname=None):
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1")
+    if not ssl_verify_enabled(hostname):
+        env["GIT_SSL_NO_VERIFY"] = "true"
+    elif ca := ssl_ca_bundle():
+        env["GIT_SSL_CAINFO"] = ca
     try:
         run = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=env, timeout=timeout)
     except subprocess.TimeoutExpired as error:
         operation = args[0] if args else "operation"
-        raise ValueError(f"Git {operation} timed out after {timeout} seconds. Check GitHub connectivity and try again.") from error
+        raise ValueError(f"Git {operation} timed out after {timeout} seconds. Check GitHub/GitLab connectivity and try again.") from error
     if run.returncode:
         raise ValueError(run.stderr.decode(errors="replace").strip() or "Git command failed")
     return run.stdout
 
 
 def remote_url(value):
-    parts = urlsplit(value)
-    if parts.scheme != "https" or parts.hostname != "github.com" or parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError("Remote repositories must use https://github.com/OWNER/REPO; local paths also work")
-    pieces = parts.path.strip("/").removesuffix(".git").split("/")
-    if len(pieces) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", x) and x not in (".", "..") for x in pieces):
+    parts = urlsplit(str(value).strip())
+    provider = remote_provider(parts.hostname)
+    if (parts.scheme != "https" or not provider or parts.username or parts.password
+            or parts.query or parts.fragment):
+        raise ValueError("Remote repositories must use https://github.com/OWNER/REPO or "
+                         "https://gitlab.example/GROUP/PROJECT; local paths also work")
+    pieces = [piece for piece in parts.path.strip("/").removesuffix(".git").split("/") if piece]
+    if (len(pieces) < 2 or any(piece in {".", "..", "-", "tree", "blob", "raw", "commit", "commits",
+                                         "merge_requests", "issues", "pipelines", "wikis"}
+                               for piece in pieces)
+            or not all(PATH_SEGMENT.fullmatch(piece) for piece in pieces)):
+        raise ValueError("Use a repository URL, without /tree/, /blob/, or /-/")
+    if provider == "github" and len(pieces) != 2:
         raise ValueError("Use a repository URL, without /tree/ or /blob/")
-    return "https://github.com/" + "/".join(pieces) + ".git"
+    return f"https://{parts.hostname.casefold()}/{'/'.join(pieces)}.git"
+
+
+def authenticated_remote_url(url):
+    """Attach a host token for private Git HTTPS operations when available."""
+    parts = urlsplit(url)
+    if parts.username or parts.password:
+        return url
+    provider = remote_provider(parts.hostname)
+    token = ""
+    username = ""
+    if provider == "gitlab":
+        token = os.environ.get("GITLAB_TOKEN", "").strip() or os.environ.get("PRIVATE_TOKEN", "").strip()
+        username = "oauth2"
+    elif provider == "github":
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        username = "x-access-token"
+    if not token:
+        return url
+    netloc = f"{username}:{quote(token, safe='')}@{parts.hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def pull_request_location(value):
+    """Parse a GitHub pull request or GitLab merge request URL.
+
+    Returns (owner, repository, number) for GitHub URLs so existing callers and
+    tests keep working, and a location dict for GitLab URLs. Prefer
+    pull_request_metadata() for provider-agnostic handling.
+    """
+    location = _change_request_location(value)
+    if location["provider"] == "github":
+        owner, repository = location["project_path"].split("/", 1)
+        return owner, repository, location["number"]
+    return location
+
+
+def _change_request_location(value):
     parts = urlsplit(str(value).strip())
-    if parts.scheme != "https" or parts.hostname != "github.com" or parts.username or parts.password:
-        raise ValueError("Use a public GitHub pull request URL such as https://github.com/OWNER/REPO/pull/123")
-    pieces = parts.path.strip("/").split("/")
-    if (len(pieces) not in (4, 5) or pieces[2] != "pull" or not pieces[3].isdigit()
-            or (len(pieces) == 5 and pieces[4] not in {"checks", "commits", "files"})
-            or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", piece) for piece in pieces[:2])):
-        raise ValueError("Use a public GitHub pull request URL such as https://github.com/OWNER/REPO/pull/123")
-    owner, repository, _, number = pieces[:4]
-    if int(number) < 1:
-        raise ValueError("Pull request number must be positive")
-    return owner, repository.removesuffix(".git"), int(number)
+    provider = remote_provider(parts.hostname)
+    github_help = "Use a public GitHub pull request URL such as https://github.com/OWNER/REPO/pull/123"
+    gitlab_help = ("Use a GitLab merge request URL such as "
+                   "https://gitlab.com/GROUP/PROJECT/-/merge_requests/123")
+    if parts.scheme != "https" or not provider or parts.username or parts.password:
+        raise ValueError(f"{github_help}, or {gitlab_help}")
+    pieces = [piece for piece in parts.path.strip("/").split("/") if piece]
+    host = parts.hostname.casefold()
+    if provider == "github":
+        if (len(pieces) not in (4, 5) or pieces[2] != "pull" or not pieces[3].isdigit()
+                or (len(pieces) == 5 and pieces[4] not in {"checks", "commits", "files"})
+                or not all(PATH_SEGMENT.fullmatch(piece) for piece in pieces[:2])):
+            raise ValueError(github_help)
+        owner, repository, _, number = pieces[:4]
+        repository = repository.removesuffix(".git")
+        if int(number) < 1:
+            raise ValueError("Pull request number must be positive")
+        project_path = f"{owner}/{repository}"
+        return {
+            "provider": "github",
+            "host": host,
+            "project_path": project_path,
+            "number": int(number),
+            "repository": f"https://github.com/{project_path}",
+            "url": f"https://github.com/{project_path}/pull/{int(number)}",
+            "head_ref": f"refs/pull/{int(number)}/head",
+        }
+    # GitLab: /group[/subgroup]/project/-/merge_requests/123[/diffs|/commits|...]
+    try:
+        marker = pieces.index("-")
+    except ValueError as error:
+        raise ValueError(gitlab_help) from error
+    project_pieces, rest = pieces[:marker], pieces[marker + 1:]
+    if (len(project_pieces) < 2 or len(rest) < 2 or rest[0] != "merge_requests"
+            or not rest[1].isdigit()
+            or (len(rest) > 2 and rest[2] not in {"diffs", "commits", "pipelines", "reports"})
+            or not all(PATH_SEGMENT.fullmatch(piece) for piece in project_pieces)):
+        raise ValueError(gitlab_help)
+    number = int(rest[1])
+    if number < 1:
+        raise ValueError("Merge request number must be positive")
+    project_path = "/".join(piece.removesuffix(".git") if index == len(project_pieces) - 1 else piece
+                            for index, piece in enumerate(project_pieces))
+    return {
+        "provider": "gitlab",
+        "host": host,
+        "project_path": project_path,
+        "number": number,
+        "repository": f"https://{host}/{project_path}",
+        "url": f"https://{host}/{project_path}/-/merge_requests/{number}",
+        "head_ref": f"refs/merge-requests/{number}/head",
+    }
 
 
-def pull_request_metadata(value):
-    owner, repository, number = pull_request_location(value)
-    api_url = f"https://api.github.com/repos/{owner}/{repository}/pulls/{number}"
-    def github_json(url, description):
-        request = Request(url, headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "adoc-dita/0.2.0",
-            "X-GitHub-Api-Version": "2022-11-28",
-        })
-        if token := os.environ.get("GITHUB_TOKEN", "").strip():
-            request.add_header("Authorization", "Bearer " + token)
-        try:
-            with urlopen(request, timeout=30) as response:
-                payload = response.read(1024 * 1024 + 1)
-        except HTTPError as error:
-            if error.code == 404:
-                raise ValueError(f"GitHub {description} not found or not public") from error
-            if error.code == 403:
-                raise ValueError("GitHub API rate limit reached. Try again later.") from error
-            raise ValueError(f"GitHub could not load the {description} (HTTP {error.code})") from error
-        except URLError as error:
-            raise ValueError(f"Could not reach GitHub: {error.reason}") from error
-        if len(payload) > 1024 * 1024:
-            raise ValueError(f"GitHub {description} response exceeded 1 MB")
-        try:
-            return json.loads(payload)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"GitHub returned an invalid {description} response") from error
+def _api_json(url, *, provider, description, headers):
+    request = Request(url, headers={
+        "User-Agent": "adoc-dita/0.2.0",
+        **headers,
+    })
+    label = "GitHub" if provider == "github" else "GitLab"
+    hostname = urlsplit(url).hostname
+    try:
+        with urlopen(request, timeout=30, context=ssl_context(hostname)) as response:
+            payload = response.read(1024 * 1024 + 1)
+    except HTTPError as error:
+        if error.code == 404:
+            raise ValueError(f"{label} {description} not found or not accessible") from error
+        if error.code in (401, 403):
+            token_hint = ("Set GITHUB_TOKEN for private GitHub access or higher rate limits."
+                          if provider == "github"
+                          else "Set GITLAB_TOKEN for private GitLab access or higher rate limits.")
+            if error.code == 403 and provider == "github":
+                raise ValueError(f"GitHub API rate limit or permission error. {token_hint}") from error
+            raise ValueError(f"{label} denied access to the {description}. {token_hint}") from error
+        raise ValueError(f"{label} could not load the {description} (HTTP {error.code})") from error
+    except URLError as error:
+        reason = str(error.reason)
+        if "CERTIFICATE_VERIFY_FAILED" in reason or "certificate verify failed" in reason.lower():
+            raise ValueError(
+                f"Could not reach {label}: TLS certificate verification failed. "
+                "Set ADOC_DITA_CA_BUNDLE or SSL_CERT_FILE to your corporate CA bundle, "
+                "or set ADOC_DITA_SSL_VERIFY=0 for local use with a private CA."
+            ) from error
+        raise ValueError(f"Could not reach {label}: {error.reason}") from error
+    if len(payload) > 1024 * 1024:
+        raise ValueError(f"{label} {description} response exceeded 1 MB")
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{label} returned an invalid {description} response") from error
 
-    data = github_json(api_url, "pull request")
+
+def _github_pull_request_metadata(location):
+    owner, repository = location["project_path"].split("/", 1)
+    number = location["number"]
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token := os.environ.get("GITHUB_TOKEN", "").strip():
+        headers["Authorization"] = "Bearer " + token
+    data = _api_json(f"https://api.github.com/repos/{owner}/{repository}/pulls/{number}",
+                     provider="github", description="pull request", headers=headers)
     try:
         base = data["base"]
         head = data["head"]
@@ -98,7 +278,7 @@ def pull_request_metadata(value):
         base_sha, head_sha = str(base["sha"]), str(head["sha"])
     except (KeyError, TypeError) as error:
         raise ValueError("GitHub returned an invalid pull request response") from error
-    if full_name.casefold() != f"{owner}/{repository}".casefold():
+    if full_name.casefold() != location["project_path"].casefold():
         raise ValueError("Pull request base repository does not match its URL")
     if not all(re.fullmatch(r"[0-9a-fA-F]{40}", sha) for sha in [base_sha, head_sha]):
         raise ValueError("GitHub returned invalid pull request commits")
@@ -106,9 +286,9 @@ def pull_request_metadata(value):
     # base branch tip. Ask the compare endpoint for that exact merge base. A
     # page beyond the commit list omits file patches and keeps this response
     # bounded even for very large documentation pull requests.
-    comparison = github_json(
+    comparison = _api_json(
         f"https://api.github.com/repos/{owner}/{repository}/compare/{base_sha}...{head_sha}?per_page=1&page=2147483647",
-        "pull request comparison")
+        provider="github", description="pull request comparison", headers=headers)
     try:
         merge_base = str(comparison["merge_base_commit"]["sha"])
     except (KeyError, TypeError) as error:
@@ -116,29 +296,97 @@ def pull_request_metadata(value):
     if not re.fullmatch(r"[0-9a-fA-F]{40}", merge_base):
         raise ValueError("GitHub returned an invalid pull request merge base")
     return {
-        "url": f"https://github.com/{owner}/{repository}/pull/{number}",
+        "url": location["url"],
         "number": number,
         "title": str(data.get("title") or f"Pull request #{number}"),
         "state": str(data.get("state") or "unknown"),
-        "repository": f"https://github.com/{owner}/{repository}",
+        "provider": "github",
+        "repository": location["repository"],
         "base": {"ref": str(base["ref"]), "commit": merge_base, "tip": base_sha},
-        "target": {"ref": f"refs/pull/{number}/head", "label": str(head.get("label") or "PR head"),
+        "target": {"ref": location["head_ref"], "label": str(head.get("label") or "PR head"),
                    "commit": head_sha},
     }
+
+
+def _gitlab_merge_request_metadata(location):
+    host = location["host"]
+    project = quote(location["project_path"], safe="")
+    number = location["number"]
+    headers = {"Accept": "application/json"}
+    if token := os.environ.get("GITLAB_TOKEN", "").strip() or os.environ.get("PRIVATE_TOKEN", "").strip():
+        headers["PRIVATE-TOKEN"] = token
+    data = _api_json(f"https://{host}/api/v4/projects/{project}/merge_requests/{number}",
+                     provider="gitlab", description="merge request", headers=headers)
+    try:
+        diff_refs = data.get("diff_refs") or {}
+        merge_base = str(diff_refs.get("base_sha") or "")
+        head_sha = str(diff_refs.get("head_sha") or data.get("sha") or "")
+        tip = str(diff_refs.get("start_sha") or "")
+        target_branch = str(data.get("target_branch") or "")
+        source_branch = str(data.get("source_branch") or "")
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError("GitLab returned an invalid merge request response") from error
+    # Prefer the authoritative project path from the API when present.
+    web_url = str(data.get("web_url") or location["url"])
+    project_url = location["repository"]
+    if isinstance(data.get("references"), dict) and "full" in data["references"]:
+        # references.full looks like group/project!123 — strip the IID suffix.
+        full_ref = str(data["references"]["full"])
+        if "!" in full_ref:
+            project_url = f"https://{host}/{full_ref.rsplit('!', 1)[0]}"
+    elif data.get("project_id") is not None and data.get("web_url"):
+        project_url = web_url.rsplit("/-/merge_requests/", 1)[0]
+    if not all(re.fullmatch(r"[0-9a-fA-F]{40}", sha) for sha in [merge_base, head_sha] if sha):
+        raise ValueError("GitLab returned invalid merge request commits")
+    if not merge_base or not head_sha:
+        raise ValueError("GitLab merge request is missing diff refs; reopen or update the MR and try again")
+    if not tip:
+        tip = merge_base
+    if target_branch:
+        try:
+            branch = _api_json(
+                f"https://{host}/api/v4/projects/{project}/repository/branches/{quote(target_branch, safe='')}",
+                provider="gitlab", description="target branch", headers=headers)
+            tip = str(branch.get("commit", {}).get("id") or tip)
+        except ValueError:
+            pass
+    if tip and not re.fullmatch(r"[0-9a-fA-F]{40}", tip):
+        raise ValueError("GitLab returned an invalid target branch tip")
+    return {
+        "url": web_url,
+        "number": number,
+        "title": str(data.get("title") or f"Merge request !{number}"),
+        "state": str(data.get("state") or "unknown"),
+        "provider": "gitlab",
+        "repository": project_url,
+        "base": {"ref": target_branch or "target", "commit": merge_base, "tip": tip},
+        "target": {"ref": location["head_ref"],
+                   "label": source_branch or f"MR !{number}",
+                   "commit": head_sha},
+    }
+
+
+def pull_request_metadata(value):
+    location = _change_request_location(value)
+    if location["provider"] == "github":
+        return _github_pull_request_metadata(location)
+    return _gitlab_merge_request_metadata(location)
 
 
 def refs(repo):
     if str(repo).startswith("https:"):
         url = remote_url(str(repo))
-        raw = git(ROOT, "ls-remote", "--heads", "--tags", url).decode()
+        host = urlsplit(url).hostname
+        fetch_url = authenticated_remote_url(url)
+        raw = git(ROOT, "ls-remote", "--heads", "--tags", fetch_url, hostname=host).decode()
         return sorted({line.split("\t")[1].removeprefix("refs/heads/").removeprefix("refs/tags/") for line in raw.splitlines() if not line.endswith("^{}")})
     return git(Path(repo).expanduser().resolve(), "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/tags", "refs/remotes").decode().splitlines()
 
 
-def resolve(repo, ref):
+def resolve(repo, ref, hostname=None):
     if not ref or ref.startswith("-") or "\x00" in ref:
         raise ValueError("Select a branch, tag, or commit")
-    return git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").decode().strip()
+    return git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}", hostname=hostname).decode().strip()
 
 
 def prepare_repository(value, base, target, cache=None):
@@ -146,6 +394,8 @@ def prepare_repository(value, base, target, cache=None):
         repo = Path(value).expanduser().resolve()
         return repo, resolve(repo, base), resolve(repo, target)
     url = remote_url(str(value))
+    host = urlsplit(url).hostname
+    fetch_url = authenticated_remote_url(url)
     cache = Path(cache or ROOT / ".cache/repos")
     repo = cache / hashlib.sha256(url.encode()).hexdigest()[:24]
     cache.mkdir(parents=True, exist_ok=True)
@@ -161,19 +411,23 @@ def prepare_repository(value, base, target, cache=None):
             if lock.is_file() or lock.is_symlink():
                 lock.unlink()
         if not (repo / "HEAD").exists():
-            git(repo, "init", "--bare")
+            git(repo, "init", "--bare", hostname=host)
         advertised = {}
-        for line in git(ROOT, "ls-remote", "--heads", "--tags", url).decode().splitlines():
+        for line in git(ROOT, "ls-remote", "--heads", "--tags", fetch_url, hostname=host).decode().splitlines():
+            if not line.strip():
+                continue
             sha, name = line.split("\t")
             advertised[name] = sha
 
         def fetch(ref):
             if not ref or ref.startswith("-"):
                 raise ValueError("Invalid release reference")
-            if re.fullmatch(r"refs/pull/[1-9][0-9]*/head", ref):
-                lines = git(ROOT, "ls-remote", url, ref).decode().splitlines()
+            if re.fullmatch(r"refs/(?:pull|merge-requests)/[1-9][0-9]*/head", ref):
+                lines = [line for line in git(ROOT, "ls-remote", fetch_url, ref, hostname=host).decode().splitlines() if line.strip()]
                 if len(lines) != 1:
-                    raise ValueError("Pull request head is not available")
+                    raise ValueError(
+                        "Pull/merge request head is not available. "
+                        "For private GitLab projects set GITLAB_TOKEN; for private GitHub set GITHUB_TOKEN.")
                 sha, name = lines[0].split("\t")
                 advertised[name] = sha
             names = [ref] if ref.startswith("refs/") else ["refs/heads/" + ref, "refs/tags/" + ref]
@@ -188,10 +442,20 @@ def prepare_repository(value, base, target, cache=None):
                 raise ValueError(f"Reference not found: {ref}")
             # Fetch only the chosen snapshot, pinned to the advertised object ID.
             try:
-                git(repo, "cat-file", "-e", sha + "^{commit}", timeout=30)
+                git(repo, "cat-file", "-e", sha + "^{commit}", timeout=30, hostname=host)
             except ValueError:
-                git(repo, "fetch", "--no-tags", "--depth=1", url, sha)
-            return resolve(repo, sha)
+                try:
+                    git(repo, "fetch", "--no-tags", "--depth=1", fetch_url, sha, hostname=host)
+                except ValueError:
+                    # Some hosts reject bare SHA wants; fall back to the PR/MR head ref.
+                    mr_refs = [name for name in advertised if re.fullmatch(r"refs/(?:pull|merge-requests)/[1-9][0-9]*/head", name)
+                               and advertised.get(name + "^{}", advertised[name]) == sha]
+                    if not mr_refs and re.fullmatch(r"refs/(?:pull|merge-requests)/[1-9][0-9]*/head", ref):
+                        mr_refs = [ref]
+                    if not mr_refs:
+                        raise
+                    git(repo, "fetch", "--no-tags", "--depth=1", fetch_url, mr_refs[0], hostname=host)
+            return resolve(repo, sha, hostname=host)
 
         base_sha, target_sha = fetch(base), fetch(target)
     return repo, base_sha, target_sha
@@ -341,11 +605,46 @@ def affected_topics(root, selected, touched, attribute_files, attributes=None):
     return affected
 
 
+def normalize_repository_attribute_path(value):
+    """Accept a repo-relative path, or extract one from a GitHub/GitLab blob URL."""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Attributes file path cannot be empty")
+    expanded = Path(text).expanduser()
+    if expanded.is_absolute():
+        return text
+    parts = urlsplit(text)
+    if parts.scheme in {"http", "https"}:
+        provider = remote_provider(parts.hostname)
+        pieces = [piece for piece in parts.path.strip("/").split("/") if piece]
+        relative = None
+        if provider == "github" and len(pieces) >= 4 and pieces[2] == "blob":
+            relative = "/".join(pieces[4:])
+        elif provider == "gitlab":
+            try:
+                marker = pieces.index("-")
+            except ValueError:
+                marker = -1
+            if marker >= 2 and len(pieces) > marker + 2 and pieces[marker + 1] == "blob":
+                relative = "/".join(pieces[marker + 3:])
+        if not relative or not relative.lower().endswith(".adoc"):
+            raise ValueError(
+                "Attributes file must be a repository-relative path such as common/attributes.adoc, "
+                "not a browser page URL. You can also upload the .adoc file.")
+        text = relative
+    path = PurePosixPath(text)
+    if path.is_absolute() or ".." in path.parts or not text.lower().endswith(".adoc"):
+        raise ValueError("Attributes file must be a repository-relative .adoc path such as common/attributes.adoc")
+    return path.as_posix()
+
+
 def compare(repository, base, target, *, patterns=None, attributes=None, attribute_files=None,
             attribute_text="", attribute_filename=None, kind="auto", progress=None, guide=None):
     progress = progress or (lambda message: None)
     patterns = patterns or ["*.adoc"]
     attribute_text = attribute_text or ""
+    if attribute_files is not None:
+        attribute_files = [normalize_repository_attribute_path(path) for path in attribute_files]
     if attribute_text:
         if len(attribute_text.encode()) > 2 * 1024 * 1024:
             raise ValueError("Uploaded attributes file must be smaller than 2 MB")
@@ -391,9 +690,18 @@ def compare(repository, base, target, *, patterns=None, attributes=None, attribu
             elif guide:
                 files = []
             else:
-                files = ["artifacts/attributes.adoc"] if (root / "artifacts/attributes.adoc").is_file() else []
+                files = []
+                for candidate in ("artifacts/attributes.adoc", "common/attributes.adoc"):
+                    if (root / candidate).is_file():
+                        files = [candidate]
+                        break
             if uploaded_path:
                 files.append(uploaded_path)
+            missing = [path for path in files if path != uploaded_path and not (root / path).is_file()]
+            if missing:
+                raise ValueError(
+                    "Missing attribute file in the selected snapshot: " + ", ".join(missing)
+                    + ". Use a repository-relative path such as common/attributes.adoc.")
             snapshot_attribute_files[root] = files
         if not guide:
             progress("Mapping changed and dependency-affected topics…")
@@ -484,12 +792,15 @@ def compare(repository, base, target, *, patterns=None, attributes=None, attribu
 def compare_pull_request(pull_request_url, *, patterns=None, attributes=None, attribute_files=None,
                          attribute_text="", attribute_filename=None, kind="auto", progress=None, guide=None):
     progress = progress or (lambda message: None)
-    progress("Resolving the GitHub pull request…")
+    progress("Resolving the pull request…")
     metadata = pull_request_metadata(pull_request_url)
-    # GitHub's merge base is the comparison base for this PR. The named base
+    # The merge base is the comparison base for this PR/MR. The named base
     # branch can advance independently and must not turn those later changes
     # into apparent PR deletions or modifications.
-    report = compare(metadata["repository"], metadata["base"]["commit"], metadata["target"]["ref"],
+    # Pin both sides to the exact SHAs already resolved from the host API. This
+    # avoids depending on refs/pull/*/head or refs/merge-requests/*/head being
+    # advertised to an unauthenticated git ls-remote.
+    report = compare(metadata["repository"], metadata["base"]["commit"], metadata["target"]["commit"],
                      patterns=patterns, attributes=attributes, attribute_files=attribute_files,
                      attribute_text=attribute_text, attribute_filename=attribute_filename,
                      kind=kind, progress=progress, guide=guide)

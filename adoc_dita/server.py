@@ -27,7 +27,8 @@ from urllib.parse import urlsplit, parse_qs
 
 from .cli import parse_attributes
 from .context import convert_standalone
-from .repository import compare, compare_pull_request, pull_request_location, refs
+from .repository import (compare, compare_pull_request, is_supported_remote_repository,
+                          pull_request_location, refs)
 from .report import zip_report
 from .usage import UsageLogger
 
@@ -122,8 +123,8 @@ def serve(port=8765):
                     return self.respond(413, {"error": "Input must be smaller than 2 MB"})
                 data = json.loads(self.rfile.read(size))
                 if self.path == "/api/refs":
-                    if network_workspace and not str(data.get("repository", "")).startswith("https://github.com/"):
-                        raise ValueError("Hosted comparisons require a public https://github.com/OWNER/REPO URL")
+                    if network_workspace and not is_supported_remote_repository(data.get("repository", "")):
+                        raise ValueError("Hosted comparisons require a public GitHub or GitLab repository HTTPS URL")
                     return self.respond(200, {"refs": refs(data["repository"])})
                 if self.path == "/api/convert":
                     started = time.monotonic()
@@ -147,8 +148,8 @@ def serve(port=8765):
                         pull_request_location(pull_request_url)
                     else:
                         repository = data["repository"]
-                        if network_workspace and not str(repository).startswith("https://github.com/"):
-                            raise ValueError("Hosted comparisons require a public https://github.com/OWNER/REPO URL")
+                        if network_workspace and not is_supported_remote_repository(repository):
+                            raise ValueError("Hosted comparisons require a public GitHub or GitLab repository HTTPS URL")
                     attribute_files = data.get("attribute_files") or []
                     if not isinstance(attribute_files, list) or any(not isinstance(path, str) for path in attribute_files):
                         raise ValueError("Attributes file paths must be a list")
