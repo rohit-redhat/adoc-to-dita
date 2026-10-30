@@ -130,22 +130,46 @@ def remote_url(value):
     return f"https://{parts.hostname.casefold()}/{'/'.join(pieces)}.git"
 
 
+def provider_token(provider):
+    """Optional host token, same pattern for GitHub and GitLab.
+
+    Public repositories work without a token. Set GITHUB_TOKEN or GITLAB_TOKEN
+    for private projects and higher API rate limits.
+    """
+    if provider == "github":
+        return os.environ.get("GITHUB_TOKEN", "").strip()
+    if provider == "gitlab":
+        return os.environ.get("GITLAB_TOKEN", "").strip() or os.environ.get("PRIVATE_TOKEN", "").strip()
+    return ""
+
+
+def api_headers(provider):
+    """Build API headers; attach a Bearer token when one is configured."""
+    if provider == "github":
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+    else:
+        headers = {"Accept": "application/json"}
+    if token := provider_token(provider):
+        headers["Authorization"] = "Bearer " + token
+        # Classic GitLab personal access tokens also accept PRIVATE-TOKEN.
+        if provider == "gitlab":
+            headers["PRIVATE-TOKEN"] = token
+    return headers
+
+
 def authenticated_remote_url(url):
     """Attach a host token for private Git HTTPS operations when available."""
     parts = urlsplit(url)
     if parts.username or parts.password:
         return url
     provider = remote_provider(parts.hostname)
-    token = ""
-    username = ""
-    if provider == "gitlab":
-        token = os.environ.get("GITLAB_TOKEN", "").strip() or os.environ.get("PRIVATE_TOKEN", "").strip()
-        username = "oauth2"
-    elif provider == "github":
-        token = os.environ.get("GITHUB_TOKEN", "").strip()
-        username = "x-access-token"
+    token = provider_token(provider)
     if not token:
         return url
+    username = "oauth2" if provider == "gitlab" else "x-access-token"
     netloc = f"{username}:{quote(token, safe='')}@{parts.hostname}"
     if parts.port:
         netloc += f":{parts.port}"
@@ -263,31 +287,26 @@ def _api_json(url, *, provider, description, headers):
 def _github_pull_request_metadata(location):
     owner, repository = location["project_path"].split("/", 1)
     number = location["number"]
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if token := os.environ.get("GITHUB_TOKEN", "").strip():
-        headers["Authorization"] = "Bearer " + token
+    headers = api_headers("github")
     data = _api_json(f"https://api.github.com/repos/{owner}/{repository}/pulls/{number}",
                      provider="github", description="pull request", headers=headers)
     try:
         base = data["base"]
         head = data["head"]
         full_name = data["base"]["repo"]["full_name"]
-        base_sha, head_sha = str(base["sha"]), str(head["sha"])
+        # base.sha is the current tip of the base branch; head.sha is the PR tip.
+        tip, head_sha = str(base["sha"]), str(head["sha"])
     except (KeyError, TypeError) as error:
         raise ValueError("GitHub returned an invalid pull request response") from error
     if full_name.casefold() != location["project_path"].casefold():
         raise ValueError("Pull request base repository does not match its URL")
-    if not all(re.fullmatch(r"[0-9a-fA-F]{40}", sha) for sha in [base_sha, head_sha]):
+    if not all(re.fullmatch(r"[0-9a-fA-F]{40}", sha) for sha in [tip, head_sha]):
         raise ValueError("GitHub returned invalid pull request commits")
-    # GitHub's PR file list is based on the common ancestor, not the current
-    # base branch tip. Ask the compare endpoint for that exact merge base. A
-    # page beyond the commit list omits file patches and keeps this response
-    # bounded even for very large documentation pull requests.
+    # PR diffs are based on the common ancestor, not the current base tip. Ask
+    # the compare endpoint for that exact merge base. A page beyond the commit
+    # list omits file patches and keeps this response bounded.
     comparison = _api_json(
-        f"https://api.github.com/repos/{owner}/{repository}/compare/{base_sha}...{head_sha}?per_page=1&page=2147483647",
+        f"https://api.github.com/repos/{owner}/{repository}/compare/{tip}...{head_sha}?per_page=1&page=2147483647",
         provider="github", description="pull request comparison", headers=headers)
     try:
         merge_base = str(comparison["merge_base_commit"]["sha"])
@@ -302,31 +321,29 @@ def _github_pull_request_metadata(location):
         "state": str(data.get("state") or "unknown"),
         "provider": "github",
         "repository": location["repository"],
-        "base": {"ref": str(base["ref"]), "commit": merge_base, "tip": base_sha},
+        "base": {"ref": str(base["ref"]), "commit": merge_base, "tip": tip},
         "target": {"ref": location["head_ref"], "label": str(head.get("label") or "PR head"),
                    "commit": head_sha},
     }
 
 
 def _gitlab_merge_request_metadata(location):
+    """Resolve an MR the same way GitHub PRs are resolved: tip + merge base + head."""
     host = location["host"]
     project = quote(location["project_path"], safe="")
     number = location["number"]
-    headers = {"Accept": "application/json"}
-    if token := os.environ.get("GITLAB_TOKEN", "").strip() or os.environ.get("PRIVATE_TOKEN", "").strip():
-        headers["PRIVATE-TOKEN"] = token
+    headers = api_headers("gitlab")
     data = _api_json(f"https://{host}/api/v4/projects/{project}/merge_requests/{number}",
                      provider="gitlab", description="merge request", headers=headers)
     try:
         diff_refs = data.get("diff_refs") or {}
-        merge_base = str(diff_refs.get("base_sha") or "")
         head_sha = str(diff_refs.get("head_sha") or data.get("sha") or "")
+        merge_base = str(diff_refs.get("base_sha") or "")
         tip = str(diff_refs.get("start_sha") or "")
         target_branch = str(data.get("target_branch") or "")
         source_branch = str(data.get("source_branch") or "")
     except (KeyError, TypeError, AttributeError) as error:
         raise ValueError("GitLab returned an invalid merge request response") from error
-    # Prefer the authoritative project path from the API when present.
     web_url = str(data.get("web_url") or location["url"])
     project_url = location["repository"]
     if isinstance(data.get("references"), dict) and "full" in data["references"]:
@@ -334,14 +351,13 @@ def _gitlab_merge_request_metadata(location):
         full_ref = str(data["references"]["full"])
         if "!" in full_ref:
             project_url = f"https://{host}/{full_ref.rsplit('!', 1)[0]}"
-    elif data.get("project_id") is not None and data.get("web_url"):
+    elif data.get("web_url"):
         project_url = web_url.rsplit("/-/merge_requests/", 1)[0]
-    if not all(re.fullmatch(r"[0-9a-fA-F]{40}", sha) for sha in [merge_base, head_sha] if sha):
+    if head_sha and not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
         raise ValueError("GitLab returned invalid merge request commits")
-    if not merge_base or not head_sha:
-        raise ValueError("GitLab merge request is missing diff refs; reopen or update the MR and try again")
-    if not tip:
-        tip = merge_base
+    if not head_sha:
+        raise ValueError("GitLab merge request is missing a head commit")
+    # Same shape as GitHub: tip = current target-branch tip.
     if target_branch:
         try:
             branch = _api_json(
@@ -352,6 +368,20 @@ def _gitlab_merge_request_metadata(location):
             pass
     if tip and not re.fullmatch(r"[0-9a-fA-F]{40}", tip):
         raise ValueError("GitLab returned an invalid target branch tip")
+    # Same as GitHub's compare call: resolve the merge base from tip + head when
+    # the MR payload does not already include diff_refs.base_sha.
+    if not merge_base:
+        if not tip:
+            raise ValueError("GitLab merge request is missing diff refs; reopen or update the MR and try again")
+        merge = _api_json(
+            f"https://{host}/api/v4/projects/{project}/repository/merge_base"
+            f"?refs[]={quote(tip, safe='')}&refs[]={quote(head_sha, safe='')}",
+            provider="gitlab", description="merge base", headers=headers)
+        merge_base = str(merge.get("id") or "")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", merge_base):
+        raise ValueError("GitLab returned an invalid merge request merge base")
+    if not tip:
+        tip = merge_base
     return {
         "url": web_url,
         "number": number,
